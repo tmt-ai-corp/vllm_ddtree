@@ -77,12 +77,16 @@ def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
 
 
 class DFlashAttention(Attention):
+    """Attention with DFlash-specific KV allocation semantics.
+
+    The compute path keeps the layer's configured sliding window. The KV cache
+    spec is widened to full attention because DFlash writes every context KV
+    before drafting and cannot evict old context blocks from draft layers.
+    """
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
         if isinstance(spec, SlidingWindowSpec):
-            # DFlash pre-populates context KV for every draft layer, so the
-            # cache must retain the full context even when the layer computes
-            # with a sliding attention window.
             return FullAttentionSpec(
                 block_size=spec.block_size,
                 num_kv_heads=spec.num_kv_heads,
