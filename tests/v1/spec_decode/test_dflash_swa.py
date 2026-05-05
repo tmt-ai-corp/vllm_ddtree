@@ -5,14 +5,14 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.models.qwen3_dflash import DFlashAttention
 from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
+    SlidingWindowSpec,
 )
-from vllm.v1.spec_decode import dflash as dflash_module
 from vllm.v1.spec_decode.dflash import DFlashProposer
 
 
@@ -25,21 +25,6 @@ class _FakeBuilder:
 
     def build_for_drafting(self, common_attn_metadata, draft_index):
         return SimpleNamespace(causal=common_attn_metadata.causal)
-
-
-class _FakeBackend:
-    @classmethod
-    def full_cls_name(cls):
-        return "fake.backend"
-
-    @classmethod
-    def get_builder_cls(cls):
-        return _FakeBuilder
-
-
-class _FakeLayer:
-    def get_attn_backend(self):
-        return _FakeBackend
 
 
 class _FakeAttentionGroup:
@@ -81,13 +66,35 @@ def test_dflash_speculators_preserves_swa_config():
     assert hf_config["max_window_layers"] == len(layer_types)
 
 
+def test_dflash_swa_layers_use_full_kv_cache_spec(monkeypatch):
+    sliding_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+        sliding_window=4,
+    )
+    monkeypatch.setattr(
+        Attention,
+        "get_kv_cache_spec",
+        lambda self, vllm_config: sliding_spec,
+    )
+
+    spec = DFlashAttention.get_kv_cache_spec(
+        object.__new__(DFlashAttention), SimpleNamespace()
+    )
+
+    assert isinstance(spec, FullAttentionSpec)
+    assert spec.block_size == sliding_spec.block_size
+    assert spec.num_kv_heads == sliding_spec.num_kv_heads
+    assert spec.head_size == sliding_spec.head_size
+    assert spec.sliding_window is None
+
+
 def test_dflash_swa_layers_use_causal_metadata():
     proposer = object.__new__(DFlashProposer)
     proposer.model = SimpleNamespace(sliding_attention_layer_names={"layer.sw"})
-    proposer.draft_attn_groups = [
-        _FakeAttentionGroup(["layer.sw"]),
-        _FakeAttentionGroup(["layer.full"]),
-    ]
+    proposer.draft_attn_groups = [_FakeAttentionGroup(["layer.sw", "layer.full"])]
     cad = CommonAttentionMetadata(
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
@@ -105,59 +112,6 @@ def test_dflash_swa_layers_use_causal_metadata():
         proposer, cad
     )
 
-    assert per_group[0].causal is True
-    assert per_group[1].causal is False
+    assert per_group[0].causal is False
     assert per_layer["layer.sw"].causal is True
     assert per_layer["layer.full"].causal is False
-
-
-def test_dflash_initializes_split_swa_draft_groups(monkeypatch):
-    proposer = object.__new__(DFlashProposer)
-    proposer.vllm_config = SimpleNamespace()
-    proposer.device = torch.device("cpu")
-    proposer.model = SimpleNamespace(sliding_attention_layer_names={"layer.sw"})
-    proposer._draft_attn_layer_names = {"layer.sw", "layer.full"}
-
-    monkeypatch.setattr(
-        dflash_module,
-        "get_layers_from_vllm_config",
-        lambda *args, **kwargs: {
-            "layer.sw": _FakeLayer(),
-            "layer.full": _FakeLayer(),
-        },
-    )
-
-    kv_cache_config = KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer.sw"],
-                FullAttentionSpec(
-                    block_size=16,
-                    num_kv_heads=1,
-                    head_size=8,
-                    dtype=torch.float16,
-                    sliding_window=4,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["layer.full"],
-                FullAttentionSpec(
-                    block_size=16,
-                    num_kv_heads=1,
-                    head_size=8,
-                    dtype=torch.float16,
-                ),
-            ),
-        ],
-    )
-
-    DFlashProposer.initialize_attn_backend(proposer, kv_cache_config, [16, 16])
-
-    assert len(proposer.draft_attn_groups) == 2
-    assert {group.kv_cache_group_id for group in proposer.draft_attn_groups} == {0, 1}
-    assert {tuple(group.layer_names) for group in proposer.draft_attn_groups} == {
-        ("layer.sw",),
-        ("layer.full",),
-    }

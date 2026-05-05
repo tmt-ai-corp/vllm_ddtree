@@ -80,6 +80,9 @@ class DFlashAttention(Attention):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
         if isinstance(spec, SlidingWindowSpec):
+            # DFlash pre-populates context KV for every draft layer, so the
+            # cache must retain the full context even when the layer computes
+            # with a sliding attention window.
             return FullAttentionSpec(
                 block_size=spec.block_size,
                 num_kv_heads=spec.num_kv_heads,
@@ -88,7 +91,6 @@ class DFlashAttention(Attention):
                 dtype=spec.dtype,
                 kv_quant_mode=spec.kv_quant_mode,
                 page_size_padded=spec.page_size_padded,
-                sliding_window=spec.sliding_window,
             )
         return spec
 
