@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -79,6 +80,7 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 
 logger = init_logger(__name__)
+_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 # The hash seed for the first block of any prefix block sequence.
 #
@@ -900,7 +902,10 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
-def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+def _pool_bytes_per_block(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
     """
     Bytes consumed by one block in the worker's shared KV cache pool, mirroring
     the divisor used by `get_kv_cache_config_from_groups` to convert
@@ -922,7 +927,7 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
             for g in kv_cache_groups
         )
         return layer_tuple_page_bytes * num_layer_tuples
-    group_size = max(len(g.layer_names) for g in kv_cache_groups)
+    group_size = _get_kv_tensor_group_size(vllm_config, kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
     return page_size * group_size
 
@@ -954,6 +959,69 @@ def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
     page_sizes = {layer.page_size_bytes for layer in kv_cache_specs}
     assert len(page_sizes) == 1
     return page_sizes.pop()
+
+
+def _get_dflash_isolated_group_ids(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> set[int]:
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or spec_config.method != "dflash":
+        return set()
+
+    try:
+        target_num_layers = vllm_config.model_config.get_num_layers(
+            vllm_config.parallel_config
+        )
+    except Exception:
+        return set()
+
+    group_ids: set[int] = set()
+    for group_id, group in enumerate(kv_cache_groups):
+        layer_indices: list[int] = []
+        for layer_name in group.layer_names:
+            match = _LAYER_INDEX_RE.search(layer_name)
+            if match is None:
+                layer_indices = []
+                break
+            layer_indices.append(int(match.group(1)))
+        if layer_indices and all(idx >= target_num_layers for idx in layer_indices):
+            group_ids.add(group_id)
+    return group_ids
+
+
+def _split_dflash_isolated_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[list[KVCacheGroupSpec], list[str]]:
+    isolated_group_ids = _get_dflash_isolated_group_ids(vllm_config, kv_cache_groups)
+    if not isolated_group_ids:
+        return kv_cache_groups, []
+    return (
+        [
+            group
+            for group_id, group in enumerate(kv_cache_groups)
+            if group_id not in isolated_group_ids
+        ],
+        [
+            layer_name
+            for group_id in sorted(isolated_group_ids)
+            for layer_name in kv_cache_groups[group_id].layer_names
+        ],
+    )
+
+
+def _get_kv_tensor_group_size(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    shared_groups, isolated_layer_names = _split_dflash_isolated_groups(
+        vllm_config, kv_cache_groups
+    )
+    shared_group_size = (
+        max(len(group.layer_names) for group in shared_groups) if shared_groups else 0
+    )
+    return shared_group_size + len(isolated_layer_names)
 
 
 def _get_kv_cache_groups_uniform_spec(
@@ -1290,7 +1358,18 @@ def get_kv_cache_config_from_groups(
         # (sw.1, padding) will be: (group_size = 2)
         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
         # full.1, sw.2: share another Tensor with size=available_memory//2
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        # DFlash precomputes draft context K/V directly into cache. Keep
+        # draft-only KV groups on their own raw tensors; the logical KV groups
+        # and per-group block tables remain unchanged.
+        shared_groups, isolated_layer_names = _split_dflash_isolated_groups(
+            vllm_config, kv_cache_groups
+        )
+        shared_group_size = (
+            max(len(group.layer_names) for group in shared_groups)
+            if shared_groups
+            else 0
+        )
+        group_size = shared_group_size + len(isolated_layer_names)
 
         page_size = get_uniform_page_size(
             [group.kv_cache_spec for group in kv_cache_groups]
@@ -1300,13 +1379,17 @@ def get_kv_cache_config_from_groups(
             vllm_config, group_size, available_memory, page_size
         )
         kv_cache_tensors = []
-        for i in range(group_size):
+        for i in range(shared_group_size):
             shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
+            for group in shared_groups:
+                if i < len(group.layer_names):
+                    shared_by.append(group.layer_names[i])
             kv_cache_tensors.append(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+            )
+        for layer_name in isolated_layer_names:
+            kv_cache_tensors.append(
+                KVCacheTensor(size=page_size * num_blocks, shared_by=[layer_name])
             )
 
     return KVCacheConfig(
@@ -1994,7 +2077,7 @@ def get_kv_cache_configs(
             if not groups:
                 adjusted_memory.append(avail_mem)
                 continue
-            bytes_per_block = _pool_bytes_per_block(groups)
+            bytes_per_block = _pool_bytes_per_block(vllm_config, groups)
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
                 avail_mem // bytes_per_block,
