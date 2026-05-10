@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.config import SpeculativeConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.qwen3_dflash import DFlashAttention
 from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
@@ -86,6 +87,28 @@ def test_dflash_speculators_preserves_swa_config():
     assert hf_config["max_window_layers"] == len(layer_types)
     assert hf_config["eagle_aux_hidden_state_layer_ids"] == [1, 2, 3]
     assert hf_config["dflash_config"]["target_layer_ids"] == [0, 1, 2]
+
+
+def _compute_dflash_hash(hf_config: SimpleNamespace) -> str:
+    config = object.__new__(SpeculativeConfig)
+    config.method = "dflash"
+    config.draft_model_config = SimpleNamespace(hf_config=hf_config)
+    return config.compute_hash()
+
+
+def test_dflash_compile_hash_uses_checkpoint_layer_id_semantics():
+    dflash_hash = _compute_dflash_hash(
+        SimpleNamespace(dflash_config={"target_layer_ids": [0, 2]})
+    )
+    shifted_aux_hash = _compute_dflash_hash(
+        SimpleNamespace(eagle_aux_hidden_state_layer_ids=[1, 3])
+    )
+    different_hash = _compute_dflash_hash(
+        SimpleNamespace(dflash_config={"target_layer_ids": [0, 3]})
+    )
+
+    assert dflash_hash == shifted_aux_hash
+    assert dflash_hash != different_hash
 
 
 def test_dflash_swa_layers_use_full_kv_cache_spec(monkeypatch):
