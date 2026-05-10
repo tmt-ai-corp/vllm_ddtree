@@ -30,7 +30,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -1526,7 +1530,9 @@ class SpecDecodeBaseProposer:
             )
         self.kv_cache_gid = self._draft_kv_cache_group_ids[0]
 
-        attention_groups: dict[tuple[int, str, Any], AttentionGroup] = {}
+        attention_groups: dict[
+            tuple[int, tuple[str, str], KVCacheSpec], AttentionGroup
+        ] = {}
         for layer_name in self._draft_attn_layer_names:
             gid = self._draft_layer_to_kv_cache_gid[layer_name]
             kv_cache_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec

@@ -6771,9 +6771,8 @@ class GPUModelRunner(
         raw_tensor_physical_orders: dict[int, set[tuple[str, ...]]] = defaultdict(set)
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
-            if (
-                group.kv_cache_group_id == len(kernel_block_sizes)
-                or not isinstance(kv_cache_spec, AttentionSpec)
+            if group.kv_cache_group_id == len(kernel_block_sizes) or not isinstance(
+                kv_cache_spec, AttentionSpec
             ):
                 continue
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
@@ -6875,13 +6874,11 @@ class GPUModelRunner(
                         and shared_physical_order is not None
                         and kv_cache_spec.page_size_padded is None
                     ):
-                        kv_caches[layer_name] = (
-                            self._view_kv_cache_with_physical_order(
-                                raw_tensor,
-                                kv_cache_shape,
-                                public_order,
-                                shared_physical_order,
-                            )
+                        kv_caches[layer_name] = self._view_kv_cache_with_physical_order(
+                            raw_tensor,
+                            kv_cache_shape,
+                            public_order,
+                            shared_physical_order,
                         )
                         continue
 

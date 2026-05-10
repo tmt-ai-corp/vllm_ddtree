@@ -275,9 +275,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
             )
 
         primary_kv_cache_gid = draft_kv_group_ids[0]
-        query_slot_mapping = self._slot_mapping_buffers_by_gid[primary_kv_cache_gid][
-            1
-        ][:num_query_total]
+        query_slot_mapping = self._slot_mapping_buffers_by_gid[primary_kv_cache_gid][1][
+            :num_query_total
+        ]
         new_query_start_loc = self.arange[: batch_size + 1] * num_query_per_req
 
         # In padded mode, cad.seq_lens includes rejected tokens. Subtract
