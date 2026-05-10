@@ -41,6 +41,21 @@ class _FakeAttentionGroup:
         return self._builder
 
 
+def _make_cad(block_table, slot_mapping) -> CommonAttentionMetadata:
+    return CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        num_reqs=1,
+        num_actual_tokens=2,
+        max_query_len=2,
+        max_seq_len=2,
+        block_table_tensor=block_table,
+        slot_mapping=slot_mapping,
+        causal=False,
+    )
+
+
 def test_dflash_speculators_preserves_swa_config():
     layer_types = [
         "sliding_attention",
@@ -109,17 +124,9 @@ def test_dflash_swa_layers_use_causal_metadata():
         "layer.full": 0,
     }
     proposer._draft_block_tables = {}
-    cad = CommonAttentionMetadata(
-        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
-        seq_lens=torch.tensor([2], dtype=torch.int32),
-        num_reqs=1,
-        num_actual_tokens=2,
-        max_query_len=2,
-        max_seq_len=2,
-        block_table_tensor=torch.empty(1, 1, dtype=torch.int32),
-        slot_mapping=torch.empty(2, dtype=torch.int64),
-        causal=False,
+    cad = _make_cad(
+        torch.empty(1, 1, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int64),
     )
     proposer._slot_mapping_buffers_by_gid = {0: (cad.slot_mapping, cad.slot_mapping)}
 
@@ -151,18 +158,7 @@ def test_dflash_metadata_uses_per_kv_group_slot_mapping():
     full_slots = torch.tensor([111, 112], dtype=torch.int64)
     sw_slots = torch.tensor([211, 212], dtype=torch.int64)
 
-    base_cad = CommonAttentionMetadata(
-        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
-        seq_lens=torch.tensor([2], dtype=torch.int32),
-        num_reqs=1,
-        num_actual_tokens=2,
-        max_query_len=2,
-        max_seq_len=2,
-        block_table_tensor=full_block_table,
-        slot_mapping=full_slots,
-        causal=False,
-    )
+    base_cad = _make_cad(full_block_table, full_slots)
     proposer._draft_block_tables = {
         1: full_block_table,
         2: sw_block_table,
