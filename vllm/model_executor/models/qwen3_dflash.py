@@ -84,6 +84,12 @@ class DFlashAttention(Attention):
     before drafting and cannot evict old context blocks from draft layers.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        # DFlash draft attention runs over text/query tokens with prewritten K/V.
+        # Do not inherit a multimodal-prefix mask requirement from the target.
+        kwargs.setdefault("use_mm_prefix", False)
+        super().__init__(*args, **kwargs)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
         if isinstance(spec, SlidingWindowSpec):
