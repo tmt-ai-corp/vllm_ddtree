@@ -302,6 +302,12 @@ class DFlashQwen3Model(nn.Module):
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        target_config = vllm_config.model_config.hf_text_config
+        self.embed_normalizer: float | None = None
+        if str(getattr(target_config, "model_type", "")).startswith("gemma4"):
+            # Gemma4 scales token embeddings by sqrt(hidden_size). DFlash
+            # shares the target embeddings, so the draft path must match.
+            self.embed_normalizer = target_config.hidden_size**0.5
 
         self.layer_types = _get_dflash_layer_types(self.config)
         self.layers = nn.ModuleList(
@@ -349,7 +355,8 @@ class DFlashQwen3Model(nn.Module):
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        embeds = self.embed_tokens(input_ids)
+        return embeds * self.embed_normalizer if self.embed_normalizer else embeds
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -595,6 +602,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size,
             scale=logit_scale,
+            soft_cap=getattr(self.config, "final_logit_softcapping", None),
         )
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
