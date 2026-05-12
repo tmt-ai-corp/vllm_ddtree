@@ -3807,7 +3807,7 @@ class GPUModelRunner(
         src_by_req: list[torch.Tensor] = []
         dst_by_req: list[torch.Tensor] = []
 
-        seen_kv_cache_ptrs: set[int] = set()
+        seen_kv_cache_storages: set[tuple[int, int]] = set()
         for kv_cache_gid, kv_cache_group in enumerate(
             self.kv_cache_config.kv_cache_groups
         ):
@@ -3834,10 +3834,13 @@ class GPUModelRunner(
                 ].kv_cache
                 if not isinstance(kv_cache, torch.Tensor):
                     continue
-                ptr = kv_cache.untyped_storage().data_ptr()
-                if ptr in seen_kv_cache_ptrs:
+                storage_key = (
+                    kv_cache.untyped_storage().data_ptr(),
+                    kv_cache.storage_offset(),
+                )
+                if storage_key in seen_kv_cache_storages:
                     continue
-                seen_kv_cache_ptrs.add(ptr)
+                seen_kv_cache_storages.add(storage_key)
                 compact_kv_cache_by_slots([kv_cache], src_slots, dst_slots)
 
     @contextmanager

@@ -3,6 +3,10 @@
 
 import torch
 
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import (
+    make_kv_sharing_fast_prefill_common_attn_metadata,
+)
 from vllm.v1.spec_decode.ddtree import (
     build_ddtree_proposal,
     follow_verified_tree,
@@ -69,3 +73,48 @@ def test_compact_kv_cache_by_slots_keeps_accepted_slots():
     flat_after = kv_cache.reshape(2, 8, 1, 1)
     torch.testing.assert_close(flat_after[:, 4], flat_before[:, 4])
     torch.testing.assert_close(flat_after[:, 5], flat_before[:, 7])
+
+
+def test_kv_sharing_fast_prefill_preserves_ddtree_metadata():
+    positions = torch.tensor([10, 11, 11, 20, 21], dtype=torch.long)
+    visibility = torch.zeros((2, 3, 3), dtype=torch.bool)
+    visibility[0, :3, :3] = torch.tensor(
+        [
+            [True, False, False],
+            [True, True, False],
+            [True, False, True],
+        ]
+    )
+    visibility[1, :2, :2] = torch.tensor(
+        [
+            [True, False],
+            [True, True],
+        ]
+    )
+    tree_lengths = torch.tensor([3, 2], dtype=torch.int32)
+    logits_indices = torch.arange(5, dtype=torch.int32)
+
+    metadata = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 3, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([13, 22], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=5,
+        max_query_len=3,
+        max_seq_len=22,
+        block_table_tensor=torch.zeros((2, 2), dtype=torch.int32),
+        slot_mapping=torch.arange(5, dtype=torch.long),
+        logits_indices_padded=logits_indices,
+        num_logits_indices=5,
+        positions=positions,
+        ddtree_visibility=visibility,
+        ddtree_tree_lengths=tree_lengths,
+        ddtree_position_ids=positions,
+    )
+
+    repacked = make_kv_sharing_fast_prefill_common_attn_metadata(metadata)
+
+    assert repacked.ddtree_visibility is visibility
+    assert repacked.ddtree_tree_lengths is tree_lengths
+    torch.testing.assert_close(repacked.ddtree_position_ids, positions)
+    torch.testing.assert_close(repacked.positions, positions)

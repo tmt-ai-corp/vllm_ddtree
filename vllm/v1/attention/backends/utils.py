@@ -415,6 +415,16 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
     decode_max_query_len = int(num_decode_tokens.max().item())
     total_num_decode_tokens = int(num_decode_tokens.sum().item())
 
+    positions = common_attn_metadata.positions
+    if positions is not None:
+        positions = positions.index_select(0, logits_indices.long())
+
+    ddtree_position_ids = common_attn_metadata.ddtree_position_ids
+    if ddtree_position_ids is not None:
+        ddtree_position_ids = ddtree_position_ids.index_select(
+            0, logits_indices.long()
+        )
+
     common_attn_metadata = CommonAttentionMetadata(
         query_start_loc=decode_query_start_loc,
         query_start_loc_cpu=decode_query_start_loc.to("cpu", non_blocking=True),
@@ -429,6 +439,15 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
         seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
         _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
         _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+        encoder_seq_lens=common_attn_metadata.encoder_seq_lens,
+        encoder_seq_lens_cpu=common_attn_metadata.encoder_seq_lens_cpu,
+        dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+        dcp_local_seq_lens_cpu=common_attn_metadata.dcp_local_seq_lens_cpu,
+        positions=positions,
+        ddtree_visibility=common_attn_metadata.ddtree_visibility,
+        ddtree_tree_lengths=common_attn_metadata.ddtree_tree_lengths,
+        ddtree_position_ids=ddtree_position_ids,
+        is_prefilling=common_attn_metadata.is_prefilling,
     )
     return common_attn_metadata
 
