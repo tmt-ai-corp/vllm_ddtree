@@ -5075,6 +5075,9 @@ class GPUModelRunner(
                             selected_indices_gpu
                         ],
                         positions=target_positions,
+                        ddtree_visibility=None,
+                        ddtree_tree_lengths=None,
+                        ddtree_position_ids=None,
                     )
                     token_indices_to_sample = None
                     num_rejected_tokens_gpu = None
