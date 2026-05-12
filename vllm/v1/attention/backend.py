@@ -397,6 +397,15 @@ class CommonAttentionMetadata:
     has positions available so that builders can pre-compute position-dependent
     metadata (e.g. C128A topk indices for DeepSeek V4)."""
 
+    ddtree_visibility: torch.Tensor | None = None
+    """(batch_size, max_tree_len, max_tree_len) tree visibility for DDTree."""
+
+    ddtree_tree_lengths: torch.Tensor | None = None
+    """(batch_size,) DDTree verify lengths, including the root token."""
+
+    ddtree_position_ids: torch.Tensor | None = None
+    """(num_actual_tokens,) DDTree model position ids for current tree tokens."""
+
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to

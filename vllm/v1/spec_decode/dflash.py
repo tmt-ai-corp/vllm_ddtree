@@ -12,6 +12,8 @@ from vllm.logger import init_logger
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.ddtree import DDTreeProposalBatch, build_ddtree_proposal
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
 
@@ -455,3 +457,81 @@ class DFlashProposer(SpecDecodeBaseProposer):
         if dflash_config is not None:
             use_aux_hidden_state = dflash_config.get("use_aux_hidden_state", True)
         return use_aux_hidden_state
+
+    @torch.inference_mode()
+    def propose_ddtree(
+        self,
+        # [num_tokens]
+        target_token_ids: torch.Tensor,
+        # [num_tokens] or [3, num_tokens] when M-RoPE is enabled
+        target_positions: torch.Tensor,
+        # [num_tokens, hidden_size]
+        target_hidden_states: torch.Tensor,
+        # [batch_size]
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None = None,
+    ) -> DDTreeProposalBatch:
+        """Build DDTree proposals from DFlash target-vocab draft logits."""
+
+        del sampling_metadata, slot_mappings
+        ddtree_size = self.speculative_config.ddtree_size
+        if ddtree_size is None:
+            raise RuntimeError("propose_ddtree called while DDTree is disabled")
+
+        batch_size = common_attn_metadata.batch_size()
+        target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
+        assert target_hidden_states.shape[-1] == self.hidden_size
+
+        num_tokens, token_indices_to_sample, common_attn_metadata = (
+            self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=token_indices_to_sample,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+        )
+
+        _, per_layer_attn_metadata = (
+            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+        )
+
+        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(num_tokens)
+        )
+        model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+            num_tokens, num_input_tokens, mm_embed_inputs
+        )
+
+        with set_forward_context(
+            per_layer_attn_metadata,
+            self.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            slot_mapping=self._get_slot_mapping(
+                slot_mapping_size, common_attn_metadata.slot_mapping
+            ),
+        ):
+            last_hidden_states = self.model(**model_kwargs)
+
+        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        draft_logits = self.model.compute_logits(sample_hidden_states)
+        assert draft_logits is not None
+        draft_logits = draft_logits.view(
+            batch_size, self.num_speculative_tokens, draft_logits.shape[-1]
+        )
+        proposals = [
+            build_ddtree_proposal(draft_logits[req_idx], ddtree_size)
+            for req_idx in range(batch_size)
+        ]
+        return DDTreeProposalBatch(proposals)

@@ -27,6 +27,7 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.spec_decode.ddtree import DDTreeRequestProposal
 
 
 @dataclass
@@ -143,6 +144,7 @@ class Request:
         self.discard_latest_async_tokens = False
 
         self.spec_token_ids: list[int] = []
+        self.ddtree_proposal: "DDTreeRequestProposal | None" = None
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
@@ -242,7 +244,10 @@ class Request:
 
     @property
     def num_tokens_with_spec(self) -> int:
-        return len(self._all_token_ids) + len(self.spec_token_ids)
+        num_spec_tokens = len(self.spec_token_ids)
+        if self.ddtree_proposal is not None:
+            num_spec_tokens += self.ddtree_proposal.num_nodes
+        return len(self._all_token_ids) + num_spec_tokens
 
     @property
     def num_output_tokens(self) -> int:

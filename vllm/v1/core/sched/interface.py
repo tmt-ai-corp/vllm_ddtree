@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.metrics.stats import SchedulerStats
-    from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+    from vllm.v1.outputs import DDTreeDraftProposals, DraftTokenIds, ModelRunnerOutput
     from vllm.v1.request import Request, RequestStatus
     from vllm.v1.structured_output import StructuredOutputManager
 
@@ -101,7 +101,9 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def update_draft_token_ids(self, draft_token_ids: "DraftTokenIds") -> None:
+    def update_draft_token_ids(
+        self, draft_token_ids: "DraftTokenIds | DDTreeDraftProposals"
+    ) -> None:
         """Update requests with newly generated draft token ids, applying
         structured output grammar validation if needed.
 
@@ -112,7 +114,9 @@ class SchedulerInterface(ABC):
 
     @abstractmethod
     def update_draft_token_ids_in_output(
-        self, draft_token_ids: "DraftTokenIds", scheduler_output: "SchedulerOutput"
+        self,
+        draft_token_ids: "DraftTokenIds | DDTreeDraftProposals",
+        scheduler_output: "SchedulerOutput",
     ) -> None:
         """Update scheduler output with newly generated draft token ids, applying
         structured output grammar validation if needed.

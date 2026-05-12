@@ -52,6 +52,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
+    DDTreeDraftProposals,
     DraftTokenIds,
     ModelRunnerOutput,
 )
@@ -870,7 +871,7 @@ class Worker(WorkerBase):
 
         return None
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+    def take_draft_token_ids(self) -> DraftTokenIds | DDTreeDraftProposals | None:
         return self.model_runner.take_draft_token_ids()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):

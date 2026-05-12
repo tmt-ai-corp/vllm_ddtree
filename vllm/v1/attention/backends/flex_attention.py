@@ -395,6 +395,9 @@ class FlexAttentionMetadata:
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     block_sparsity_hint: BlockSparsityHint | None = None
+    ddtree_visibility: torch.Tensor | None = None
+    ddtree_tree_lengths: torch.Tensor | None = None
+    ddtree_position_ids: torch.Tensor | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -558,7 +561,58 @@ class FlexAttentionMetadata:
 
         return final_mask_mod
 
+    def get_ddtree_mask_mod(self) -> _mask_mod_signature:
+        """Creates a paged KV mask for DDTree target verification."""
+
+        assert self.doc_ids is not None
+        assert self.ddtree_visibility is not None
+        assert self.ddtree_tree_lengths is not None
+        assert self.ddtree_position_ids is not None
+
+        def final_mask_mod(
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            physical_kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            (is_valid, logical_q_idx, logical_kv_idx) = (
+                self._convert_physical_to_logical(self.doc_ids, q_idx, physical_kv_idx)
+            )
+            q_req = self.doc_ids[q_idx]
+            tree_start = self.decode_offset[q_req]
+            tree_len = self.ddtree_tree_lengths[q_req]
+            q_tree_idx = logical_q_idx - tree_start
+            kv_tree_idx = logical_kv_idx - tree_start
+            q_is_tree = (q_tree_idx >= 0) & (q_tree_idx < tree_len)
+            kv_is_past = logical_kv_idx < tree_start
+            kv_is_tree = (kv_tree_idx >= 0) & (kv_tree_idx < tree_len)
+
+            max_tree_len = self.ddtree_visibility.shape[1]
+            safe_q_tree_idx = torch.clamp(q_tree_idx, 0, max_tree_len - 1)
+            safe_kv_tree_idx = torch.clamp(kv_tree_idx, 0, max_tree_len - 1)
+            tree_visible = self.ddtree_visibility[
+                q_req, safe_q_tree_idx, safe_kv_tree_idx
+            ]
+            visible = is_valid & q_is_tree & (
+                kv_is_past | (kv_is_tree & tree_visible)
+            )
+
+            if self.sliding_window is not None:
+                q_pos = self.ddtree_position_ids[q_idx]
+                kv_tree_pos = self.ddtree_position_ids[
+                    self.query_start_loc[q_req] + safe_kv_tree_idx
+                ]
+                kv_pos = torch.where(kv_is_tree, kv_tree_pos, logical_kv_idx)
+                visible = visible & (torch.abs(q_pos - kv_pos) < self.sliding_window)
+
+            return visible
+
+        return final_mask_mod
+
     def get_mask_mod(self):
+        if self.ddtree_visibility is not None:
+            return self.get_ddtree_mask_mod()
+
         # Stage-1: initialize the base mask_mod
         # (causal mask for decoder or bidirectional mask for encoder)
         if self.uses_paged_kv:
@@ -909,6 +963,9 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             persistent_kv_indices=self.persistent_kv_indices,
             persistent_kv_num_blocks=self.persistent_kv_num_blocks,
             persistent_doc_ids=self.persistent_doc_ids,
+            ddtree_visibility=common_attn_metadata.ddtree_visibility,
+            ddtree_tree_lengths=common_attn_metadata.ddtree_tree_lengths,
+            ddtree_position_ids=common_attn_metadata.ddtree_position_ids,
         )
 
         # Pre-build block_mask so it is ready before CUDA graph capture.
@@ -970,16 +1027,26 @@ class FlexAttentionImpl(AttentionImpl):
 
         self.kv_cache_dtype = kv_cache_dtype
         self.logits_soft_cap = logits_soft_cap
+        self.score_mod = None
         if self.logits_soft_cap is not None:
-            raise NotImplementedError(
-                "FlexAttention does not support logits soft cap yet."
-            )
+            soft_cap = float(self.logits_soft_cap)
+
+            def softcap_score_mod(
+                score: torch.Tensor,
+                b: torch.Tensor,
+                h: torch.Tensor,
+                q_idx: torch.Tensor,
+                kv_idx: torch.Tensor,
+            ) -> torch.Tensor:
+                del b, h, q_idx, kv_idx
+                return soft_cap * torch.tanh(score / soft_cap)
+
+            self.score_mod = softcap_score_mod
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        if kv_sharing_target_layer_name is not None:
-            raise NotImplementedError("FlexAttention does not support kv sharing yet.")
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
             raise NotImplementedError(
@@ -1085,6 +1152,12 @@ class FlexAttentionImpl(AttentionImpl):
         ):
             attn_metadata.block_sparsity_hint = layer_hint
             needs_rebuild_block_mask = True
+
+        if attn_metadata.score_mod is not self.score_mod:
+            attn_metadata.score_mod = self.score_mod
+            attn_metadata.transformed_score_mod = (
+                attn_metadata.get_transformed_score_mod()
+            )
 
         if needs_rebuild_block_mask or attn_metadata.block_mask is None:
             if attn_metadata.direct_build:

@@ -319,6 +319,97 @@ def compute_kv_seq_mask(
 
 
 @triton.jit
+def compute_ddtree_kv_seq_mask(
+    query_model_pos,
+    query_pos,
+    seq_offset,
+    seq_idx,
+    context_len,
+    cur_batch_start,
+    ddtree_visibility_ptr,
+    ddtree_tree_lengths_ptr,
+    ddtree_position_ids_ptr,
+    mm_prefix_range_ptr,
+    SLIDING_WINDOW: tl.constexpr,
+    USE_MM_PREFIX: tl.constexpr,
+    MAX_MM_RANGES: tl.constexpr,
+    MAX_DDTREE_TREE_LEN: tl.constexpr,
+    CHUNK_LOOKBACK: tl.constexpr = -1,
+    CHUNK_SIZE: tl.constexpr = -1,
+):
+    """Build a causal/tree visibility mask for one DDTree verification tile.
+
+    During DDTree target verification, current-step KV slots are laid out in
+    flattened tree order while RoPE positions follow tree depth. Prefix keys are
+    visible normally; keys inside the current tree are visible only when the
+    per-request ancestor matrix permits them.
+    """
+    tree_len = tl.load(ddtree_tree_lengths_ptr + seq_idx)
+    kv_tree_pos = seq_offset - context_len
+    is_tree_kv = (seq_offset >= context_len) & (kv_tree_pos < tree_len)
+    prefix_mask = seq_offset[None, :] < context_len
+
+    tree_bounds = (
+        (query_pos[:, None] < tree_len)
+        & (kv_tree_pos[None, :] >= 0)
+        & (kv_tree_pos[None, :] < tree_len)
+    )
+    visibility_offset = (
+        seq_idx * MAX_DDTREE_TREE_LEN * MAX_DDTREE_TREE_LEN
+        + query_pos[:, None] * MAX_DDTREE_TREE_LEN
+        + kv_tree_pos[None, :]
+    )
+    tree_visible = tl.load(
+        ddtree_visibility_ptr + visibility_offset,
+        mask=tree_bounds,
+        other=0,
+    ).to(tl.int1)
+    seq_mask = prefix_mask | (is_tree_kv[None, :] & tree_visible)
+
+    key_tree_model_pos = tl.load(
+        ddtree_position_ids_ptr + cur_batch_start + kv_tree_pos,
+        mask=is_tree_kv,
+        other=0,
+    )
+    key_model_pos = tl.where(is_tree_kv, key_tree_model_pos, seq_offset)
+
+    if CHUNK_LOOKBACK > -1:
+        q_chunk = query_model_pos // CHUNK_SIZE
+        k_chunk = key_model_pos[None, :] // CHUNK_SIZE
+        chunk_distance = q_chunk - k_chunk
+        seq_mask = seq_mask & (
+            (chunk_distance >= 0) & (chunk_distance <= CHUNK_LOOKBACK)
+        )
+    elif SLIDING_WINDOW > 0:
+        pos_distance = query_model_pos - key_model_pos[None, :]
+        seq_mask = seq_mask & (
+            (pos_distance >= 0) & (pos_distance < SLIDING_WINDOW)
+        )
+
+    if USE_MM_PREFIX:
+        for i in range(MAX_MM_RANGES):
+            range_start = tl.load(
+                mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
+            )
+            range_end = tl.load(
+                mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1
+            )
+            is_valid = range_start < range_end
+            q_in_range = (
+                (query_model_pos >= range_start)
+                & (query_model_pos <= range_end)
+                & is_valid
+            )
+            k_in_range = (
+                (key_model_pos[None, :] >= range_start)
+                & (key_model_pos[None, :] <= range_end)
+                & is_valid
+            )
+            seq_mask |= q_in_range & k_in_range
+    return seq_mask
+
+
+@triton.jit
 def apply_alibi_to_score(
     S,
     alibi_slope,

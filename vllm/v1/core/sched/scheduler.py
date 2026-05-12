@@ -50,8 +50,14 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DDTreeDraftProposals,
+    DraftTokenIds,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.ddtree import DDTreeRequestProposal
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -212,6 +218,19 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
+            if (
+                speculative_config.use_ddtree()
+                and speculative_config.ddtree_verify_tokens_per_req
+                > self.max_num_scheduled_tokens
+            ):
+                raise ValueError(
+                    "DDTree verify length "
+                    f"({speculative_config.ddtree_verify_tokens_per_req}) exceeds "
+                    "the scheduler token budget "
+                    f"({self.max_num_scheduled_tokens}). Increase "
+                    "max_num_batched_tokens/max_num_scheduled_tokens or reduce "
+                    "ddtree_size."
+                )
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.requires_eagle_cache_drop = (
@@ -340,6 +359,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        scheduled_ddtree_proposals: dict[str, DDTreeRequestProposal] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -372,15 +392,45 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            ddtree_proposal = request.ddtree_proposal
+            if ddtree_proposal is None:
+                if (
+                    0
+                    < self.scheduler_config.long_prefill_token_threshold
+                    < num_new_tokens
+                ):
+                    num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                num_new_tokens = min(num_new_tokens, token_budget)
 
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-            )
+                # Make sure the input position does not exceed the max model len.
+                # This is necessary when using spec decoding.
+                num_new_tokens = min(
+                    num_new_tokens,
+                    self.max_model_len - 1 - request.num_computed_tokens,
+                )
+            else:
+                verify_length = ddtree_proposal.verify_length
+                model_len_capacity = (
+                    self.max_model_len - 1 - request.num_computed_tokens
+                )
+                if model_len_capacity < verify_length:
+                    # Close to the model length limit, a full tree cannot fit.
+                    # Fall back to computing only the root token.
+                    request.ddtree_proposal = None
+                    num_new_tokens = min(
+                        request.num_tokens
+                        + request.num_output_placeholders
+                        - request.num_computed_tokens,
+                        token_budget,
+                        model_len_capacity,
+                    )
+                elif token_budget < verify_length:
+                    # DDTree verification cannot be chunked because siblings are
+                    # only meaningful under the tree visibility mask.
+                    req_index += 1
+                    continue
+                else:
+                    num_new_tokens = verify_length
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -450,6 +500,7 @@ class Scheduler(SchedulerInterface):
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            scheduled_ddtree_proposals.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
                             )
@@ -484,7 +535,13 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
-            if request.spec_token_ids:
+            if request.ddtree_proposal is not None:
+                proposal = request.ddtree_proposal
+                assert num_new_tokens == proposal.verify_length
+                scheduled_ddtree_proposals[request_id] = proposal
+                request.ddtree_proposal = None
+                request.spec_token_ids = []
+            elif request.spec_token_ids:
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -858,6 +915,7 @@ class Scheduler(SchedulerInterface):
                 scheduled_resumed_reqs,
                 num_scheduled_tokens,
                 scheduled_spec_decode_tokens,
+                scheduled_ddtree_proposals,
                 req_to_new_blocks,
             )
 
@@ -877,6 +935,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_ddtree_proposals=scheduled_ddtree_proposals,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
@@ -928,6 +987,7 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        request.ddtree_proposal = None
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -1010,6 +1070,7 @@ class Scheduler(SchedulerInterface):
         resumed_reqs: list[Request],
         num_scheduled_tokens: dict[str, int],
         spec_decode_tokens: dict[str, list[int]],
+        ddtree_proposals: dict[str, DDTreeRequestProposal],
         req_to_new_blocks: dict[str, KVCacheBlocks],
     ) -> CachedRequestData:
         req_ids: list[str] = []
@@ -1036,9 +1097,16 @@ class Scheduler(SchedulerInterface):
                 num_tokens = num_scheduled_tokens[req_id] - len(
                     spec_decode_tokens.get(req_id, ())
                 )
-                token_ids = req.all_token_ids[
-                    req.num_computed_tokens : req.num_computed_tokens + num_tokens
-                ]
+                if req_id in ddtree_proposals:
+                    proposal = ddtree_proposals[req_id]
+                    token_ids = [req.all_token_ids[req.num_computed_tokens]]
+                    token_ids.extend(proposal.node_token_ids)
+                    assert len(token_ids) == num_tokens
+                else:
+                    token_ids = req.all_token_ids[
+                        req.num_computed_tokens : req.num_computed_tokens
+                        + num_tokens
+                    ]
                 new_token_ids.append(token_ids)
             scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
             if idx >= num_running_reqs:
@@ -1318,6 +1386,9 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            scheduled_ddtree_proposal = (
+                scheduler_output.scheduled_ddtree_proposals.get(req_id)
+            )
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -1337,6 +1408,21 @@ class Scheduler(SchedulerInterface):
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
+                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                    request_id=req_id,
+                )
+            elif scheduled_ddtree_proposal and generated_token_ids:
+                verify_length = scheduled_ddtree_proposal.verify_length
+                accepted_length = len(generated_token_ids)
+                num_rejected = verify_length - accepted_length
+                if request.num_computed_tokens > 0:
+                    request.num_computed_tokens -= num_rejected
+                if request.num_output_placeholders > 0:
+                    request.num_output_placeholders -= num_rejected
+                spec_decoding_stats = self.make_spec_decoding_stats(
+                    spec_decoding_stats,
+                    num_draft_tokens=scheduled_ddtree_proposal.num_nodes,
+                    num_accepted_tokens=max(0, accepted_length - 1),
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
@@ -1604,7 +1690,29 @@ class Scheduler(SchedulerInterface):
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
-    def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+    def update_draft_token_ids(
+        self, draft_token_ids: DraftTokenIds | DDTreeDraftProposals
+    ) -> None:
+        if isinstance(draft_token_ids, DDTreeDraftProposals):
+            for req_id, proposal in zip(
+                draft_token_ids.req_ids, draft_token_ids.proposals
+            ):
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+                if request.is_prefill_chunk:
+                    request.ddtree_proposal = None
+                    request.spec_token_ids = []
+                    continue
+                if self.structured_output_manager.should_advance(request):
+                    raise NotImplementedError(
+                        "DDTree speculative decoding with structured output "
+                        "requires branch-aware grammar state."
+                    )
+                request.spec_token_ids = []
+                request.ddtree_proposal = proposal
+            return
+
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -1627,8 +1735,26 @@ class Scheduler(SchedulerInterface):
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
-        self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
+        self,
+        draft_token_ids: DraftTokenIds | DDTreeDraftProposals,
+        scheduler_output: SchedulerOutput,
     ) -> None:
+        if isinstance(draft_token_ids, DDTreeDraftProposals):
+            for req_id, proposal in zip(
+                draft_token_ids.req_ids, draft_token_ids.proposals
+            ):
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+                if self.structured_output_manager.should_advance(request):
+                    raise NotImplementedError(
+                        "DDTree speculative decoding with structured output "
+                        "requires branch-aware grammar state."
+                    )
+                scheduler_output.scheduled_ddtree_proposals[req_id] = proposal
+            scheduler_output.num_invalid_spec_tokens = {}
+            return
+
         num_invalid_spec_tokens: dict[str, int] = {}
 
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens

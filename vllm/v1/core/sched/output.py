@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -10,21 +10,23 @@ if TYPE_CHECKING:
     import numpy.typing as npt
     import torch
 
-    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
-    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.lora.request import LoRARequest
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
-else:
-    ECConnectorMetadata = object
-    KVConnectorMetadata = object
+    from vllm.v1.spec_decode.ddtree import DDTreeRequestProposal
+
+from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+
+if not TYPE_CHECKING:
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
     SamplingParams = object
     Request = object
+    DDTreeRequestProposal = object
 
 
 @dataclass
@@ -240,6 +242,12 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # req_id -> DDTree proposal. These proposals are not linear draft tokens
+    # and must not be appended to visible token history.
+    scheduled_ddtree_proposals: dict[str, DDTreeRequestProposal] = field(
+        default_factory=dict
+    )
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -248,6 +256,7 @@ class SchedulerOutput:
             num_scheduled_tokens={},
             total_num_scheduled_tokens=0,
             scheduled_spec_decode_tokens={},
+            scheduled_ddtree_proposals={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=set(),

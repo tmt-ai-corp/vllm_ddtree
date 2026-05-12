@@ -19,6 +19,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
     cdiv_fn,
+    compute_ddtree_kv_seq_mask,
     compute_kv_seq_mask,
     compute_tile_loop_bounds,
     find_seq_idx,
@@ -104,6 +105,9 @@ def kernel_unified_attention(
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,
+    ddtree_visibility_ptr,
+    ddtree_tree_lengths_ptr,
+    ddtree_position_ids_ptr,
     stride_k_cache_0: tl.int64,  # int
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
@@ -124,6 +128,8 @@ def kernel_unified_attention(
     BLOCK_M: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
     USE_FP8: tl.constexpr,
+    USE_DDTREE: tl.constexpr,
+    MAX_DDTREE_TREE_LEN: tl.constexpr,
     # Toggles 2D vs 3D layout.  The 2D path runs the full sequence in one
     # tile loop and writes to ``output_ptr``.  The 3D path scopes the loop
     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
@@ -210,23 +216,46 @@ def kernel_unified_attention(
     if USE_QQ_BIAS:
         qq_bias_row_ptrs = qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
 
-    loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
-        context_len,
-        seq_len,
-        cur_batch_query_len,
-        q_block_local_idx,
-        segm_idx,
-        tiles_per_segment,
-        TILE_SIZE,
-        BLOCK_M,
-        BLOCK_Q,
-        num_queries_per_kv,
-        SLIDING_WINDOW,
-        USE_MM_PREFIX,
-        IS_3D,
-        CHUNK_LOOKBACK,
-        CHUNK_SIZE,
-    )
+    if USE_DDTREE:
+        # DDTree positions follow branch depth, not flattened tree order, so
+        # sliding-window tile pruning based on flat query indices would be
+        # incorrect. Keep the full causal prefix and apply the precise
+        # tree/window mask inside the tile loop.
+        loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
+            context_len,
+            seq_len,
+            cur_batch_query_len,
+            q_block_local_idx,
+            segm_idx,
+            tiles_per_segment,
+            TILE_SIZE,
+            BLOCK_M,
+            BLOCK_Q,
+            num_queries_per_kv,
+            0,
+            USE_MM_PREFIX,
+            IS_3D,
+            -1,
+            -1,
+        )
+    else:
+        loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
+            context_len,
+            seq_len,
+            cur_batch_query_len,
+            q_block_local_idx,
+            segm_idx,
+            tiles_per_segment,
+            TILE_SIZE,
+            BLOCK_M,
+            BLOCK_Q,
+            num_queries_per_kv,
+            SLIDING_WINDOW,
+            USE_MM_PREFIX,
+            IS_3D,
+            CHUNK_LOOKBACK,
+            CHUNK_SIZE,
+        )
 
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
@@ -283,18 +312,43 @@ def kernel_unified_attention(
                 v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
             )
 
-        query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = compute_kv_seq_mask(
-            query_abs_pos,
-            seq_offset,
-            seq_idx,
-            mm_prefix_range_ptr,
-            SLIDING_WINDOW,
-            USE_MM_PREFIX,
-            MAX_MM_RANGES,
-            CHUNK_LOOKBACK,
-            CHUNK_SIZE,
-        )
+        if USE_DDTREE:
+            query_abs_pos = tl.load(
+                ddtree_position_ids_ptr + query_offset_0,
+                mask=query_mask_0,
+                other=0,
+            )[:, None]
+            seq_mask = compute_ddtree_kv_seq_mask(
+                query_abs_pos,
+                query_pos,
+                seq_offset,
+                seq_idx,
+                context_len,
+                cur_batch_in_all_start_index,
+                ddtree_visibility_ptr,
+                ddtree_tree_lengths_ptr,
+                ddtree_position_ids_ptr,
+                mm_prefix_range_ptr,
+                SLIDING_WINDOW,
+                USE_MM_PREFIX,
+                MAX_MM_RANGES,
+                MAX_DDTREE_TREE_LEN,
+                CHUNK_LOOKBACK,
+                CHUNK_SIZE,
+            )
+        else:
+            query_abs_pos = context_len + query_pos[:, None]
+            seq_mask = compute_kv_seq_mask(
+                query_abs_pos,
+                seq_offset,
+                seq_idx,
+                mm_prefix_range_ptr,
+                SLIDING_WINDOW,
+                USE_MM_PREFIX,
+                MAX_MM_RANGES,
+                CHUNK_LOOKBACK,
+                CHUNK_SIZE,
+            )
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
@@ -325,7 +379,7 @@ def kernel_unified_attention(
         M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[:, None]
 
-        if SLIDING_WINDOW:
+        if SLIDING_WINDOW and not USE_DDTREE:
             qpos_lo = q_block_local_idx * BLOCK_Q
             V = tl.where(
                 (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
@@ -531,6 +585,9 @@ def unified_attention(
     sinks=None,
     # Optional tensor for prefix lengths (PrefixLM support)
     mm_prefix_range=None,
+    ddtree_visibility=None,
+    ddtree_tree_lengths=None,
+    ddtree_position_ids=None,
     use_alibi_sqrt=False,
     # KV cache quantization mode and per-token-head scale caches.
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
@@ -567,6 +624,18 @@ def unified_attention(
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
+    use_ddtree = ddtree_visibility is not None
+    if use_ddtree:
+        assert alibi_slopes is None, "DDTree Triton attention does not support ALiBi"
+        assert qq_bias is None, "DDTree Triton attention does not support QQ bias"
+        assert ddtree_tree_lengths is not None
+        assert ddtree_position_ids is not None
+        max_ddtree_tree_len = ddtree_visibility.shape[1]
+    else:
+        ddtree_visibility = block_table
+        ddtree_tree_lengths = seqused_k
+        ddtree_position_ids = cu_seqlens_q
+        max_ddtree_tree_len = 0
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -698,6 +767,9 @@ def unified_attention(
         USE_MM_PREFIX=use_mm_prefix,
         MAX_MM_RANGES=max_mm_ranges,
         mm_prefix_range_ptr=mm_prefix_range,
+        ddtree_visibility_ptr=ddtree_visibility,
+        ddtree_tree_lengths_ptr=ddtree_tree_lengths,
+        ddtree_position_ids_ptr=ddtree_position_ids,
         SLIDING_WINDOW=(1 + window_size[0]),
         stride_k_cache_0=k.stride(0),
         stride_k_cache_1=k.stride(1),
@@ -719,6 +791,8 @@ def unified_attention(
         BLOCK_M=BLOCK_M,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=output_scale is not None,
+        USE_DDTREE=use_ddtree,
+        MAX_DDTREE_TREE_LEN=max_ddtree_tree_len,
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
         CHUNK_LOOKBACK=chunk_lookback,

@@ -16,7 +16,12 @@ from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    DDTreeDraftProposals,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -129,7 +134,7 @@ class UniProcExecutor(Executor):
             single_value=True,
         )
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+    def take_draft_token_ids(self) -> DraftTokenIds | DDTreeDraftProposals | None:
         return self.collective_rpc("take_draft_token_ids", single_value=True)
 
     def check_health(self) -> None:

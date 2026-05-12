@@ -87,6 +87,10 @@ class TritonAttentionMetadata:
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
 
+    ddtree_visibility: torch.Tensor | None = None
+    ddtree_tree_lengths: torch.Tensor | None = None
+    ddtree_position_ids: torch.Tensor | None = None
+
     @staticmethod
     def compute_mm_prefix_range_tensor(
         mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
@@ -261,6 +265,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            ddtree_visibility=common_attn_metadata.ddtree_visibility,
+            ddtree_tree_lengths=common_attn_metadata.ddtree_tree_lengths,
+            ddtree_position_ids=common_attn_metadata.ddtree_position_ids,
         )
         return attn_metadata
 
@@ -608,6 +615,12 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        if attn_metadata.ddtree_visibility is not None:
+            if self.alibi_slopes is not None:
+                raise NotImplementedError(
+                    "DDTree target verification does not support ALiBi with "
+                    "TritonAttentionImpl."
+                )
 
         unified_attention(
             q=query[:num_actual_tokens],
@@ -636,6 +649,9 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            ddtree_visibility=attn_metadata.ddtree_visibility,
+            ddtree_tree_lengths=attn_metadata.ddtree_tree_lengths,
+            ddtree_position_ids=attn_metadata.ddtree_position_ids,
             kv_quant_mode=self._kv_quant_mode,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,

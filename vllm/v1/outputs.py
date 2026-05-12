@@ -10,6 +10,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.spec_decode.ddtree import DDTreeRequestProposal
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -224,6 +225,14 @@ class DraftTokenIds:
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
+
+
+@dataclass
+class DDTreeDraftProposals:
+    # [num_reqs]
+    req_ids: list[str]
+    # One DDTree proposal per request.
+    proposals: list[DDTreeRequestProposal]
 
 
 def make_empty_encoder_model_runner_output(

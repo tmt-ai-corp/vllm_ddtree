@@ -11,7 +11,10 @@ from transformers import Qwen3Config
 from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -40,6 +43,15 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
+from .littlebit_dflash import (
+    LittleBitColumnParallelLinear,
+    LittleBitDFlashConfig,
+    LittleBitReplicatedLinear,
+    LittleBitRowParallelLinear,
+    is_littlebit_metadata_name,
+    mark_littlebit_packed,
+    unpack_littlebit_state_dict,
+)
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
@@ -125,43 +137,88 @@ class DFlashQwen3Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         sliding_window: int | None = None,
+        littlebit_config: LittleBitDFlashConfig | None = None,
+        params_dtype: torch.dtype | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
         self.hidden_size = hidden_size
+        self.littlebit_config = littlebit_config
         tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= tp_size:
             assert self.total_num_kv_heads % tp_size == 0
+            self.num_kv_head_replicas = 1
         else:
             assert tp_size % self.total_num_kv_heads == 0
+            self.num_kv_head_replicas = tp_size // self.total_num_kv_heads
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=attention_bias,  # DFlash has o_proj bias when using attention bias
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
+        if littlebit_config is None:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=attention_bias,  # DFlash has o_proj bias when using attention bias
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+            )
+        else:
+            kv_shard_rank = tp_rank // self.num_kv_head_replicas
+            self.q_proj = LittleBitColumnParallelLinear(
+                hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=attention_bias,
+                littlebit_config=littlebit_config,
+                params_dtype=params_dtype,
+                output_size_per_partition=self.q_size,
+                output_shard_rank=tp_rank,
+            )
+            self.k_proj = LittleBitColumnParallelLinear(
+                hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=attention_bias,
+                littlebit_config=littlebit_config,
+                params_dtype=params_dtype,
+                output_size_per_partition=self.kv_size,
+                output_shard_rank=kv_shard_rank,
+                ratio_factor=littlebit_config.kv_factor,
+            )
+            self.v_proj = LittleBitColumnParallelLinear(
+                hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=attention_bias,
+                littlebit_config=littlebit_config,
+                params_dtype=params_dtype,
+                output_size_per_partition=self.kv_size,
+                output_shard_rank=kv_shard_rank,
+                ratio_factor=littlebit_config.kv_factor,
+            )
+            self.o_proj = LittleBitRowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=attention_bias,
+                littlebit_config=littlebit_config,
+                params_dtype=params_dtype,
+            )
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -191,8 +248,13 @@ class DFlashQwen3Attention(nn.Module):
         with the context K/V from the target model's hidden states. This forward op
         computes attention for the query tokens only.
         See also: precompute_and_store_context_kv"""
-        qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.littlebit_config is None:
+            qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
 
         # Per-head RMSNorm
         q_shape, k_shape = q.shape, k.shape
@@ -206,8 +268,51 @@ class DFlashQwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
-        return output
+        if self.littlebit_config is None:
+            output, _ = self.o_proj(attn_output)
+            return output
+        return self.o_proj(attn_output)
+
+
+class LittleBitQwen3MLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        littlebit_config: LittleBitDFlashConfig,
+        params_dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+            )
+
+        self.gate_proj = LittleBitColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            littlebit_config=littlebit_config,
+            params_dtype=params_dtype,
+        )
+        self.up_proj = LittleBitColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            littlebit_config=littlebit_config,
+            params_dtype=params_dtype,
+        )
+        self.down_proj = LittleBitRowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            littlebit_config=littlebit_config,
+            params_dtype=params_dtype,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class DFlashQwen3DecoderLayer(nn.Module):
@@ -219,6 +324,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         layer_type: str = "full_attention",
+        littlebit_config: LittleBitDFlashConfig | None = None,
+        params_dtype: torch.dtype | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -241,17 +348,28 @@ class DFlashQwen3DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             sliding_window=sliding_window,
+            littlebit_config=littlebit_config,
+            params_dtype=params_dtype,
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
         )
-        self.mlp = Qwen3MLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
+        if littlebit_config is None:
+            self.mlp = Qwen3MLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+        else:
+            self.mlp = LittleBitQwen3MLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                littlebit_config=littlebit_config,
+                params_dtype=params_dtype,
+            )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -291,7 +409,12 @@ class DFlashQwen3Model(nn.Module):
         super().__init__()
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         self.vocab_size = self.config.vocab_size
-        self.quant_config = get_draft_quant_config(vllm_config)
+        self.littlebit_config = LittleBitDFlashConfig.from_vllm_config(vllm_config)
+        self.quant_config = (
+            None
+            if self.littlebit_config is not None
+            else get_draft_quant_config(vllm_config)
+        )
 
         drafter_config = getattr(self.config, "eagle_config", {})
         drafter_config.update(getattr(self.config, "dflash_config", {}))
@@ -323,6 +446,8 @@ class DFlashQwen3Model(nn.Module):
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
                     layer_type=self.layer_types[layer_idx],
+                    littlebit_config=self.littlebit_config,
+                    params_dtype=vllm_config.model_config.dtype,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -342,15 +467,24 @@ class DFlashQwen3Model(nn.Module):
                 fc_input_size = self.config.target_hidden_size * num_features_to_use
             else:
                 fc_input_size = self.config.hidden_size * num_features_to_use
-            self.fc = ReplicatedLinear(
-                input_size=fc_input_size,
-                output_size=self.config.hidden_size,
-                bias=False,
-                params_dtype=vllm_config.model_config.dtype,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "fc"),
-                return_bias=False,
-            )
+            if self.littlebit_config is None:
+                self.fc = ReplicatedLinear(
+                    input_size=fc_input_size,
+                    output_size=self.config.hidden_size,
+                    bias=False,
+                    params_dtype=vllm_config.model_config.dtype,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "fc"),
+                    return_bias=False,
+                )
+            else:
+                self.fc = LittleBitReplicatedLinear(
+                    input_size=fc_input_size,
+                    output_size=self.config.hidden_size,
+                    bias=False,
+                    littlebit_config=self.littlebit_config,
+                    params_dtype=vllm_config.model_config.dtype,
+                )
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -372,6 +506,10 @@ class DFlashQwen3Model(nn.Module):
         layer so that precompute_and_store_context_kv can run one fused
         GEMM for all layers at once. Also aliases the weight of the hidden_norm.
         """
+        if self.littlebit_config is not None:
+            self._build_littlebit_kv_metadata()
+            return
+
         layers_attn = [layer.self_attn for layer in self.layers]
         attn0 = layers_attn[0]
         has_bias = attn0.qkv_proj.bias is not None
@@ -419,6 +557,35 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    def _build_littlebit_kv_metadata(self) -> None:
+        layers_attn = [layer.self_attn for layer in self.layers]
+        attn0 = layers_attn[0]
+
+        self._hidden_norm_weight = self.hidden_norm.weight.data
+        self._rope_head_size = attn0.rotary_emb.head_size
+        self._rope_cos_sin_cache = attn0.rotary_emb.cos_sin_cache
+        self._rope_is_neox = attn0.rotary_emb.is_neox_style
+        for attn in layers_attn[1:]:
+            assert (
+                attn.rotary_emb.head_size == self._rope_head_size
+                and attn.rotary_emb.is_neox_style == self._rope_is_neox
+            ), "All layers must have the same RoPE parameters for DFlash precomputation"
+
+        self._num_attn_layers = len(layers_attn)
+        self._kv_size = attn0.kv_size
+        self._head_dim = attn0.head_dim
+        self._num_kv_heads = attn0.num_kv_heads
+        self._rms_norm_eps = attn0.q_norm.variance_epsilon
+        for attn in layers_attn[1:]:
+            assert (
+                attn.kv_size == self._kv_size
+                and attn.head_dim == self._head_dim
+                and attn.num_kv_heads == self._num_kv_heads
+                and attn.q_norm.variance_epsilon == self._rms_norm_eps
+            ), "All layers must have the same attn config for DFlash precomputation"
+
+        self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
@@ -443,6 +610,11 @@ class DFlashQwen3Model(nn.Module):
                 "in use, this may indicate an error in weight loading."
             )
             self._build_fused_kv_buffers()
+
+        if self.littlebit_config is not None:
+            return self._precompute_and_store_context_kv_littlebit(
+                context_states, context_positions, context_slot_mapping
+            )
 
         num_ctx = context_states.shape[0]
         L = self._num_attn_layers
@@ -518,6 +690,48 @@ class DFlashQwen3Model(nn.Module):
                 layer_slot_mapping,
             )
 
+    def _precompute_and_store_context_kv_littlebit(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+    ) -> None:
+        normed_context_states = torch.empty_like(context_states)
+        ops.rms_norm(
+            normed_context_states,
+            context_states,
+            self._hidden_norm_weight,
+            self._rms_norm_eps,
+        )
+
+        for layer in self.layers:
+            attn_module = layer.self_attn
+            k = attn_module.k_proj(normed_context_states)
+            v = attn_module.v_proj(normed_context_states)
+
+            k_shape = k.shape
+            k = attn_module.k_norm(
+                k.view(*k_shape[:-1], k_shape[-1] // self._head_dim, self._head_dim)
+            ).view(k_shape)
+            k, _ = attn_module.rotary_emb(context_positions, k, None)
+
+            if context_slot_mapping is None:
+                continue
+
+            attn = attn_module.attn
+            layer_slot_mapping = (
+                context_slot_mapping[attn.layer_name]
+                if isinstance(context_slot_mapping, Mapping)
+                else context_slot_mapping
+            )
+            attn.impl.do_kv_cache_update(
+                attn,
+                k.view(context_states.shape[0], self._num_kv_heads, self._head_dim),
+                v.view(context_states.shape[0], self._num_kv_heads, self._head_dim),
+                attn.kv_cache,
+                layer_slot_mapping,
+            )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -540,18 +754,32 @@ class DFlashQwen3Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
+        weights_list = list(weights)
+        if self.littlebit_config is not None:
+            torch_dtype = next(self.parameters()).dtype
+            weights_list, was_packed = unpack_littlebit_state_dict(
+                weights_list, torch_dtype
+            )
+        else:
+            was_packed = False
+        stacked_params_mapping = (
+            []
+            if self.littlebit_config is not None
+            else [
+                (".qkv_proj", ".q_proj", "q"),
+                (".qkv_proj", ".k_proj", "k"),
+                (".qkv_proj", ".v_proj", "v"),
+                (".gate_up_proj", ".gate_proj", 0),
+                (".gate_up_proj", ".up_proj", 1),
+            ]
+        )
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
+        for name, loaded_weight in weights_list:
             if "midlayer." in name:
                 name = name.replace("midlayer.", "layers.0.")
+            if self.littlebit_config is not None and is_littlebit_metadata_name(name):
+                continue
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
@@ -580,6 +808,8 @@ class DFlashQwen3Model(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if was_packed:
+            mark_littlebit_packed(self, True)
         return loaded_params
 
 

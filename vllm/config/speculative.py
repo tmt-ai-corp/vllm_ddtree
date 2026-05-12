@@ -135,6 +135,15 @@ class SpeculativeConfig:
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
 
+    ddtree_size: int | None = Field(default=None, gt=0)
+    """Number of non-root DDTree nodes to build for DFlash. None disables
+    DDTree and keeps the normal linear speculative decoding path."""
+    ddtree_save_traces: bool = False
+    """Collect DDTree debug traces. Intended only for validation/debugging."""
+    ddtree_disable_cpu_heap: bool = False
+    """Reserved for future GPU tree builders. The CPU heap builder is the
+    reference implementation and remains enabled by default."""
+
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
     """Maximum size of ngram token window when using Ngram proposer, required
@@ -281,6 +290,7 @@ class SpeculativeConfig:
             "dflash",
         )
         factors.append(uses_aux_hidden_states)
+        factors.append(self.ddtree_size)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -974,6 +984,36 @@ class SpeculativeConfig:
                 "are only valid with rejection_sample_method='synthetic'."
             )
 
+        if self.ddtree_size is not None:
+            if self.method != "dflash":
+                raise ValueError(
+                    "ddtree_size is only supported with speculative "
+                    "method='dflash'."
+                )
+            if self.num_speculative_tokens <= 1:
+                raise ValueError(
+                    "DDTree requires num_speculative_tokens > 1 so the draft "
+                    "model has a tree depth horizon."
+                )
+            if self.use_local_argmax_reduction:
+                raise ValueError(
+                    "use_local_argmax_reduction is incompatible with DDTree. "
+                    "DDTree needs target-vocab top-k logits, not a local argmax."
+                )
+            if self.ddtree_disable_cpu_heap:
+                raise ValueError(
+                    "ddtree_disable_cpu_heap=True is reserved for a future GPU "
+                    "tree builder; the CPU heap builder is currently required."
+                )
+            if self.attention_backend is None:
+                self.attention_backend = AttentionBackendEnum.FLASH_ATTN
+            elif self.attention_backend != AttentionBackendEnum.FLASH_ATTN:
+                raise ValueError(
+                    "DDTree with DFlash currently requires the draft "
+                    "attention_backend to be FLASH_ATTN."
+                )
+            self.parallel_drafting = True
+
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
@@ -1038,11 +1078,21 @@ class SpeculativeConfig:
         if self.parallel_drafting:
             # For parallel drafting, we need one new slot per 'masked' token
             slots_per_req = self.num_speculative_tokens - 1
+        if self.ddtree_size is not None:
+            slots_per_req = max(slots_per_req, self.ddtree_size)
         if self.uses_draft_model():
             # For draft model-based speculation, we need one new slot per request
             # Since we do not slice the draft tokens
             slots_per_req += 1
         return slots_per_req
+
+    @property
+    def ddtree_max_nodes_per_req(self) -> int:
+        return 1 + (self.ddtree_size or 0)
+
+    @property
+    def ddtree_verify_tokens_per_req(self) -> int:
+        return self.ddtree_max_nodes_per_req
 
     def use_gemma4_mtp(self) -> bool:
         return (
@@ -1061,6 +1111,9 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_ddtree(self) -> bool:
+        return self.method == "dflash" and self.ddtree_size is not None
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

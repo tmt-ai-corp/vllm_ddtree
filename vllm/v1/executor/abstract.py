@@ -21,7 +21,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import DDTreeDraftProposals, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 if TYPE_CHECKING:
@@ -249,8 +249,10 @@ class Executor(ABC):
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch")
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        output: list[DraftTokenIds] = self.collective_rpc("take_draft_token_ids")
+    def take_draft_token_ids(self) -> DraftTokenIds | DDTreeDraftProposals | None:
+        output: list[DraftTokenIds | DDTreeDraftProposals] = self.collective_rpc(
+            "take_draft_token_ids"
+        )
         return output[0]
 
     @property
