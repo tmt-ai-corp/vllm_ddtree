@@ -788,10 +788,36 @@ class GPUModelRunner(
                 self.max_num_tokens, dtype=torch.int32, device=self.device
             )
 
-        self.uniform_decode_query_len = 1 + self.num_spec_tokens
+        if self.speculative_config and self.speculative_config.use_ddtree():
+            self.uniform_decode_query_len = (
+                self.speculative_config.ddtree_verify_tokens_per_req
+            )
+        else:
+            self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+
+        self._ddtree_visibility_buffer: torch.Tensor | None = None
+        self._ddtree_tree_lengths_buffer: torch.Tensor | None = None
+        self._ddtree_cu_num_verify_tokens_buffer: torch.Tensor | None = None
+        self._ddtree_tree_start_offsets_buffer: torch.Tensor | None = None
+        if self.speculative_config and self.speculative_config.use_ddtree():
+            max_verify_len = self.speculative_config.ddtree_verify_tokens_per_req
+            self._ddtree_visibility_buffer = torch.zeros(
+                (self.max_num_reqs, max_verify_len, max_verify_len),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            self._ddtree_tree_lengths_buffer = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self._ddtree_cu_num_verify_tokens_buffer = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self._ddtree_tree_start_offsets_buffer = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
 
         self.mm_budget = (
             MultiModalBudget(self.vllm_config, self.mm_registry)
@@ -2166,11 +2192,19 @@ class GPUModelRunner(
             logits_indices = torch.arange(
                 total_num_scheduled_tokens, dtype=torch.int32, device=self.device
             )
-            visibility = torch.zeros(
-                (num_reqs, max_verify_len, max_verify_len),
-                dtype=torch.bool,
-                device=self.device,
-            )
+            assert self._ddtree_visibility_buffer is not None
+            assert self._ddtree_tree_lengths_buffer is not None
+            assert self._ddtree_cu_num_verify_tokens_buffer is not None
+            assert self._ddtree_tree_start_offsets_buffer is not None
+            if max_verify_len > self._ddtree_visibility_buffer.shape[1]:
+                raise RuntimeError(
+                    "DDTree verify length exceeds the preallocated visibility "
+                    "buffer. Check speculative_config.ddtree_size."
+                )
+            visibility = self._ddtree_visibility_buffer[
+                :num_reqs, :max_verify_len, :max_verify_len
+            ]
+            visibility.zero_()
             for req_idx, visibility_cpu in enumerate(ddtree_visibility_blocks):
                 length = visibility_cpu.shape[0]
                 visibility[req_idx, :length, :length].copy_(
@@ -2179,16 +2213,23 @@ class GPUModelRunner(
             cu_num_verify_tokens = np.cumsum(
                 ddtree_num_verify_tokens, dtype=np.int32
             )
-            cu_num_verify_tokens_gpu = torch.from_numpy(cu_num_verify_tokens).to(
-                self.device, non_blocking=True
+            cu_num_verify_tokens_gpu = self._ddtree_cu_num_verify_tokens_buffer[
+                :num_reqs
+            ]
+            cu_num_verify_tokens_gpu.copy_(
+                torch.from_numpy(cu_num_verify_tokens).to(
+                    self.device, non_blocking=True
+                )
             )
-            tree_start_offsets = torch.tensor(
-                [0] + cu_num_verify_tokens[:-1].tolist(),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            tree_lengths = torch.tensor(
-                ddtree_num_verify_tokens, dtype=torch.int32, device=self.device
+            tree_start_offsets = self._ddtree_tree_start_offsets_buffer[:num_reqs]
+            tree_start_offsets[0].zero_()
+            if num_reqs > 1:
+                tree_start_offsets[1:].copy_(cu_num_verify_tokens_gpu[:-1])
+            tree_lengths = self._ddtree_tree_lengths_buffer[:num_reqs]
+            tree_lengths.copy_(
+                torch.tensor(
+                    ddtree_num_verify_tokens, dtype=torch.int32, device=self.device
+                )
             )
             spec_decode_metadata = DDTreeSpecDecodeMetadata(
                 is_ddtree=True,
