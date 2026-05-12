@@ -822,6 +822,12 @@ class VllmConfig:
             # Currently, async scheduling only support eagle speculative
             # decoding.
             if self.speculative_config is not None:
+                if self.speculative_config.use_ddtree():
+                    raise ValueError(
+                        "Async scheduling is not compatible with DDTree. "
+                        "DDTree needs the scheduler to see full tree proposals "
+                        "before allocating verification slots."
+                    )
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
@@ -851,6 +857,15 @@ class VllmConfig:
                 # impacts performance of pooling models, so we disable by default.
                 logger.debug(
                     "Disabling asynchronous scheduling by default for pooling model."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.use_ddtree()
+            ):
+                logger.warning_once(
+                    "Async scheduling is not compatible with DDTree and will "
+                    "be disabled.",
                 )
                 self.scheduler_config.async_scheduling = False
             elif (
