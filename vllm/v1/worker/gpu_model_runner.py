@@ -2430,7 +2430,7 @@ class GPUModelRunner(
                     ],
                 )
             if (
-                common_attn_metadata.ddtree_visibility is not None
+                getattr(common_attn_metadata, "ddtree_visibility", None) is not None
                 and type(builder).__name__ != "TritonAttentionMetadataBuilder"
             ):
                 raise NotImplementedError(

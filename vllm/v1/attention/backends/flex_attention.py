@@ -963,9 +963,15 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             persistent_kv_indices=self.persistent_kv_indices,
             persistent_kv_num_blocks=self.persistent_kv_num_blocks,
             persistent_doc_ids=self.persistent_doc_ids,
-            ddtree_visibility=common_attn_metadata.ddtree_visibility,
-            ddtree_tree_lengths=common_attn_metadata.ddtree_tree_lengths,
-            ddtree_position_ids=common_attn_metadata.ddtree_position_ids,
+            ddtree_visibility=getattr(
+                common_attn_metadata, "ddtree_visibility", None
+            ),
+            ddtree_tree_lengths=getattr(
+                common_attn_metadata, "ddtree_tree_lengths", None
+            ),
+            ddtree_position_ids=getattr(
+                common_attn_metadata, "ddtree_position_ids", None
+            ),
         )
 
         # Pre-build block_mask so it is ready before CUDA graph capture.
