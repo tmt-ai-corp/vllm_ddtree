@@ -7,7 +7,10 @@ import torch
 
 from vllm.config import SpeculativeConfig
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.models.qwen3_dflash import DFlashAttention
+from vllm.model_executor.models.qwen3_dflash import (
+    DFlashAttention,
+    resolve_dflash_final_logit_softcapping,
+)
 from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import (
@@ -109,6 +112,45 @@ def test_dflash_compile_hash_uses_checkpoint_layer_id_semantics():
 
     assert dflash_hash == shifted_aux_hash
     assert dflash_hash != different_hash
+
+
+def test_dflash_gemma4_draft_logits_inherit_target_softcap():
+    draft_config = SimpleNamespace()
+    target_config = SimpleNamespace(
+        model_type="gemma4_text",
+        final_logit_softcapping=30.0,
+    )
+
+    assert (
+        resolve_dflash_final_logit_softcapping(draft_config, target_config)
+        == 30.0
+    )
+
+
+def test_dflash_draft_softcap_takes_precedence():
+    draft_config = SimpleNamespace(final_logit_softcapping=12.0)
+    target_config = SimpleNamespace(
+        model_type="gemma4_text",
+        final_logit_softcapping=30.0,
+    )
+
+    assert (
+        resolve_dflash_final_logit_softcapping(draft_config, target_config)
+        == 12.0
+    )
+
+
+def test_dflash_non_gemma4_does_not_inherit_target_softcap():
+    draft_config = SimpleNamespace()
+    target_config = SimpleNamespace(
+        model_type="qwen3",
+        final_logit_softcapping=30.0,
+    )
+
+    assert (
+        resolve_dflash_final_logit_softcapping(draft_config, target_config)
+        is None
+    )
 
 
 def test_dflash_swa_layers_use_full_kv_cache_spec(monkeypatch):

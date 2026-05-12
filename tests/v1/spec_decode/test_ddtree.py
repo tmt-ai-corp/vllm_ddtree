@@ -26,11 +26,11 @@ def test_ddtree_build_and_follow_path():
     assert proposal.visibility.shape == (5, 5)
     assert proposal.visibility.diag().all()
 
-    posterior = torch.tensor([1, 3, 0, 5, 0], dtype=torch.int64)
+    posterior = torch.tensor([1, 3, 5, 0, 0], dtype=torch.int64)
     accepted_indices, next_token = follow_verified_tree(
         proposal.child_maps, posterior
     )
-    assert accepted_indices == [0, 1, 2, 4]
+    assert accepted_indices == [0, 1, 2, 3]
     assert next_token == 0
 
 

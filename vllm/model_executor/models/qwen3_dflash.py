@@ -67,6 +67,31 @@ logger = init_logger(__name__)
 _DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
 
 
+def _is_gemma4_config(config: object) -> bool:
+    return str(getattr(config, "model_type", "")).startswith("gemma4")
+
+
+def resolve_dflash_final_logit_softcapping(
+    draft_config: object, target_config: object
+) -> float | None:
+    """Resolve the logit soft cap used by the DFlash draft head.
+
+    DFlash draft checkpoints are often saved with the draft architecture config,
+    while the target model carries architecture-specific logit processing such
+    as Gemma4 final logit softcapping.  The draft head must use the same final
+    softcap before DDTree builds probabilities from draft logits.
+    """
+    draft_soft_cap = getattr(draft_config, "final_logit_softcapping", None)
+    if draft_soft_cap is not None:
+        return draft_soft_cap
+
+    target_text_config = getattr(target_config, "text_config", target_config)
+    if _is_gemma4_config(target_text_config):
+        return getattr(target_text_config, "final_logit_softcapping", None)
+
+    return None
+
+
 def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
     layer_types = getattr(config, "layer_types", None)
     if layer_types is None:
@@ -829,7 +854,20 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             start_layer_id=target_layer_num,
         )
 
+        target_config = vllm_config.model_config.hf_text_config
         logit_scale = getattr(self.config, "logit_scale", 1.0)
+        soft_cap = resolve_dflash_final_logit_softcapping(
+            self.config, target_config
+        )
+        if (
+            soft_cap is not None
+            and getattr(self.config, "final_logit_softcapping", None) is None
+        ):
+            logger.info(
+                "Using target Gemma4 final_logit_softcapping=%s for DFlash "
+                "draft logits.",
+                soft_cap,
+            )
         self.lm_head = ParallelLMHead(
             self.config.draft_vocab_size,
             self.config.hidden_size,
@@ -838,9 +876,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size,
             scale=logit_scale,
-            soft_cap=getattr(self.config, "final_logit_softcapping", None),
+            soft_cap=soft_cap,
         )
         target_vocab_size = vllm_config.model_config.get_vocab_size()
+        self.target_vocab_size = target_vocab_size
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
                 torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
@@ -876,7 +915,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         base = torch.arange(self.config.draft_vocab_size, device=logits.device)
         targets = base + self.draft_id_to_target_id
         logits_new = logits.new_full(
-            (logits.shape[0], self.config.vocab_size),
+            (logits.shape[0], self.target_vocab_size),
             float("-inf"),
         )
         logits_new[:, targets] = logits
