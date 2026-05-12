@@ -2433,12 +2433,33 @@ class GPUModelRunner(
                 common_attn_metadata.ddtree_visibility is not None
                 and type(builder).__name__ != "TritonAttentionMetadataBuilder"
             ):
-                raise NotImplementedError(
-                    "DDTree+DFlash target verification currently supports only "
-                    "target attention_backend=TRITON_ATTN with draft "
-                    "attention_backend=FLASH_ATTN. Got target metadata builder: "
-                    f"{type(builder).__name__}."
+                draft_layer_names = (
+                    getattr(dflash_drafter, "_draft_attn_layer_names", set())
+                    if dflash_drafter is not None
+                    else set()
                 )
+                is_draft_group = all(
+                    layer_name in draft_layer_names
+                    for layer_name in attn_group.layer_names
+                )
+                is_runner_only_group = all(
+                    layer_name in self.runner_only_attn_layers
+                    for layer_name in attn_group.layer_names
+                )
+                if is_draft_group or is_runner_only_group:
+                    common_attn_metadata = common_attn_metadata.replace(
+                        ddtree_visibility=None,
+                        ddtree_tree_lengths=None,
+                        ddtree_position_ids=None,
+                    )
+                else:
+                    raise NotImplementedError(
+                        "DDTree+DFlash target verification currently supports "
+                        "only target attention_backend=TRITON_ATTN with draft "
+                        "attention_backend=FLASH_ATTN. Got target metadata "
+                        f"builder: {type(builder).__name__} for layers "
+                        f"{attn_group.layer_names}."
+                    )
 
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
