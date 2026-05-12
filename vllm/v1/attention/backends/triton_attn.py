@@ -265,15 +265,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
-            ddtree_visibility=getattr(
-                common_attn_metadata, "ddtree_visibility", None
-            ),
-            ddtree_tree_lengths=getattr(
-                common_attn_metadata, "ddtree_tree_lengths", None
-            ),
-            ddtree_position_ids=getattr(
-                common_attn_metadata, "ddtree_position_ids", None
-            ),
+            ddtree_visibility=common_attn_metadata.ddtree_visibility,
+            ddtree_tree_lengths=common_attn_metadata.ddtree_tree_lengths,
+            ddtree_position_ids=common_attn_metadata.ddtree_position_ids,
         )
         return attn_metadata
 
