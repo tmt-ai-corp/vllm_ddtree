@@ -10,6 +10,10 @@ if TYPE_CHECKING:
     import numpy.typing as npt
     import torch
 
+    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorMetadata,
+    )
     from vllm.lora.request import LoRARequest
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
@@ -17,10 +21,9 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
     from vllm.v1.spec_decode.ddtree import DDTreeRequestProposal
 
-from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
-
 if not TYPE_CHECKING:
+    ECConnectorMetadata = object
+    KVConnectorMetadata = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
