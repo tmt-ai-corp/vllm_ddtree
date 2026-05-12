@@ -23,13 +23,17 @@ class DDTreeKVCommitPlan:
     kv_cache_config: object | None = None
 
 
-def _flatten_attention_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
-    """Return a view with token slot as dimension 1.
+def _copy_attention_kv_slots(
+    kv_cache: torch.Tensor,
+    src_slots: torch.Tensor,
+    dst_slots: torch.Tensor,
+) -> None:
+    """Copy selected raw slots without flattening the whole cache.
 
-    vLLM attention caches commonly use ``[2, num_blocks, block, ...]`` or
-    ``[num_blocks, 2, block, ...]``.  The returned tensor is
-    ``[2, num_slots, ...]`` so raw slot ids can be used without interpreting
-    logical positions.
+    Some backends store KV as ``[num_blocks, 2, block_size, ...]``.  Flattening
+    that layout requires a transpose and can materialize the full KV cache.
+    DDTree only needs the accepted slots, so decode raw slot ids into
+    block/offset pairs and copy just those rows.
     """
 
     if kv_cache.ndim < 4:
@@ -39,12 +43,23 @@ def _flatten_attention_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
             "[num_blocks, 2, block_size, ...]."
         )
     if kv_cache.shape[0] == 2:
-        return kv_cache.reshape(
-            2, kv_cache.shape[1] * kv_cache.shape[2], *kv_cache.shape[3:]
-        )
+        block_size = kv_cache.shape[2]
+        src_blocks = torch.div(src_slots, block_size, rounding_mode="floor")
+        src_offsets = src_slots % block_size
+        dst_blocks = torch.div(dst_slots, block_size, rounding_mode="floor")
+        dst_offsets = dst_slots % block_size
+        kept = kv_cache[:, src_blocks, src_offsets].clone()
+        kv_cache[:, dst_blocks, dst_offsets] = kept
+        return
     if kv_cache.shape[1] == 2:
-        cache = kv_cache.transpose(0, 1)
-        return cache.reshape(2, cache.shape[1] * cache.shape[2], *cache.shape[3:])
+        block_size = kv_cache.shape[2]
+        src_blocks = torch.div(src_slots, block_size, rounding_mode="floor")
+        src_offsets = src_slots % block_size
+        dst_blocks = torch.div(dst_slots, block_size, rounding_mode="floor")
+        dst_offsets = dst_slots % block_size
+        kept = kv_cache[src_blocks, :, src_offsets].clone()
+        kv_cache[dst_blocks, :, dst_offsets] = kept
+        return
     raise NotImplementedError(
         "DDTree KV compaction could not identify the K/V dimension in a cache "
         f"with shape {tuple(kv_cache.shape)}."
@@ -75,11 +90,9 @@ def compact_kv_cache_by_slots(
             continue
         seen_storage.add(storage_key)
 
-        flat = _flatten_attention_kv_cache(kv_cache)
-        src = src_slots.to(device=flat.device, dtype=torch.long, non_blocking=True)
-        dst = dst_slots.to(device=flat.device, dtype=torch.long, non_blocking=True)
-        kept = flat.index_select(1, src)
-        flat.index_copy_(1, dst, kept)
+        src = src_slots.to(device=kv_cache.device, dtype=torch.long, non_blocking=True)
+        dst = dst_slots.to(device=kv_cache.device, dtype=torch.long, non_blocking=True)
+        _copy_attention_kv_slots(kv_cache, src, dst)
 
 
 def build_slot_compaction_for_request(
