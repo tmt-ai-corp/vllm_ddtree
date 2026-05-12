@@ -788,12 +788,12 @@ class GPUModelRunner(
                 self.max_num_tokens, dtype=torch.int32, device=self.device
             )
 
-        if self.speculative_config and self.speculative_config.use_ddtree():
-            self.uniform_decode_query_len = (
-                self.speculative_config.ddtree_verify_tokens_per_req
-            )
-        else:
-            self.uniform_decode_query_len = 1 + self.num_spec_tokens
+        # Keep this tied to the drafter's linear speculative decode length.
+        # DDTree target verification can schedule a wider tree-shaped batch, but
+        # this value also drives global cudagraph capture sizes shared with the
+        # DFlash drafter. Bumping it to the DDTree verify length would pad the
+        # draft FlashAttention pass beyond its actual query batch.
+        self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
