@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.logits_processor import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.sample.sampler import _SAMPLING_EPS, Sampler
@@ -66,12 +67,27 @@ class DDTreeSampler(nn.Module):
             raise NotImplementedError(
                 "DDTree bad-words filtering needs per-tree-node sampling metadata."
             )
-        if (
-            sampling_metadata.logitsprocs.non_argmax_invariant
-            or sampling_metadata.logitsprocs.argmax_invariant
-        ):
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
             raise NotImplementedError(
-                "DDTree logits processors need per-tree-node sampling metadata."
+                "DDTree thinking-budget filtering needs per-tree-node "
+                "sampling metadata."
+            )
+        # DDTree currently follows the greedy posterior directly. Argmax
+        # invariant processors preserve the greedy choice by contract, so
+        # skipping them is equivalent for greedy verification.
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+            if isinstance(processor, MinTokensLogitsProcessor):
+                if processor.min_toks:
+                    raise NotImplementedError(
+                        "DDTree min_tokens filtering needs per-tree-node "
+                        "sampling metadata."
+                    )
+                continue
+            raise NotImplementedError(
+                "DDTree logits processors that can change greedy argmax need "
+                "per-tree-node sampling metadata. "
+                f"Unsupported processor: {type(processor).__name__}."
             )
 
         verify_logits = logits[metadata.target_logits_indices.long()].to(torch.float32)
